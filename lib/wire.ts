@@ -359,10 +359,16 @@ function parseDataChunk(payload: string): Json | null {
   }
 }
 
+/** The finish reasons the env accepts on the OpenAI wire; anything else is rewritten to `stop`. */
+const LEGAL_OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+
 /**
  * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
  * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
  * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
+ * A chunk without a `choices` array (a usage-only chunk from a sloppy provider) gets an empty one,
+ * since the env's shape check fails a chunk that carries no choices; a finish reason outside the
+ * legal OpenAI set (some providers send `eos`) is rewritten to `stop`.
  */
 function rewriteFrameWithModel(frame: string, model: string): string {
   const rewritten: string[] = [];
@@ -377,21 +383,38 @@ function rewriteFrameWithModel(frame: string, model: string): string {
       rewritten.push(line);
       continue;
     }
-    rewritten.push(`data: ${JSON.stringify({ ...chunk, model })}`);
+    const out: Json = { ...chunk, model };
+    if (!Array.isArray(out.choices)) out.choices = [];
+    if (Array.isArray(out.choices)) {
+      for (const choice of out.choices) {
+        if (isRecord(choice) && typeof choice.finish_reason === 'string' && !LEGAL_OPENAI_FINISH_REASONS.has(choice.finish_reason)) {
+          choice.finish_reason = 'stop';
+        }
+      }
+    }
+    rewritten.push(`data: ${JSON.stringify(out)}`);
   }
   return `${rewritten.join('\n')}\n\n`;
 }
 
-/** What one OpenAI stream relay has seen so far: finish, usage, [DONE], and streamed text length. */
+/** What one OpenAI stream relay has seen so far: finish, the last usage record, [DONE], text length. */
 interface OpenAIStreamState {
   sawFinish: boolean;
-  sawUsage: boolean;
+  /** The most recent usage record's input tokens, or null when none arrived (or it named none). */
+  lastUsageInput: number | null;
+  /** The most recent usage record's output tokens, or null when none arrived (or it named none). */
+  lastUsageOutput: number | null;
   sawDone: boolean;
   textChars: number;
 }
 
 function newOpenAIStreamState(): OpenAIStreamState {
-  return { sawFinish: false, sawUsage: false, sawDone: false, textChars: 0 };
+  return { sawFinish: false, lastUsageInput: null, lastUsageOutput: null, sawDone: false, textChars: 0 };
+}
+
+/** Whether the last usage record the relay saw satisfies the env's usage check. */
+function lastUsageOk(state: OpenAIStreamState): boolean {
+  return state.lastUsageInput !== null && state.lastUsageInput >= 0 && state.lastUsageOutput !== null && state.lastUsageOutput >= 1;
 }
 
 /** Inspect one frame's data payloads for a finish reason, a usage object and content text. */
@@ -401,12 +424,14 @@ function inspectOpenAIFrame(frame: string, state: OpenAIStreamState): void {
     if (payload === null) continue;
     const chunk = parseDataChunk(payload);
     if (chunk === null) continue;
-    // A usage record only counts when its output is at least 1: the env's usage check
-    // requires an output of at least 1, and a provider that reports completion_tokens 0
-    // (or omits it) must not stop the relay from synthesizing a usage chunk. This mirrors
-    // the JSON path (openAIJsonWithModel) and the Anthropic path (streamFinishEvents).
-    if (isRecord(chunk.usage) && typeof chunk.usage.completion_tokens === 'number' && chunk.usage.completion_tokens >= 1) {
-      state.sawUsage = true;
+    // The env's usage check reads the LAST usage record of the stream, so the relay tracks
+    // the last one too: a good usage chunk followed by a usage-0 record (a second usage
+    // chunk, or usage carried on the finish chunk) still fails, and must be answered with
+    // a synthesized usage chunk after it. A record that omits prompt_tokens fails the
+    // check as well (a null input), so the input is tracked alongside the output.
+    if (isRecord(chunk.usage)) {
+      state.lastUsageInput = typeof chunk.usage.prompt_tokens === 'number' && Number.isFinite(chunk.usage.prompt_tokens) ? chunk.usage.prompt_tokens : null;
+      state.lastUsageOutput = typeof chunk.usage.completion_tokens === 'number' && Number.isFinite(chunk.usage.completion_tokens) ? chunk.usage.completion_tokens : null;
     }
     if (!Array.isArray(chunk.choices) || chunk.choices.length === 0) continue;
     const choice = isRecord(chunk.choices[0]) ? chunk.choices[0] : null;
@@ -455,6 +480,28 @@ function splitCompleteFrames(buffer: string): { frames: string[]; tail: string }
   return { frames, tail: rest };
 }
 
+/**
+ * One frame as sub-frames of at most one `data:` line each: a provider may pack several events
+ * into one frame (two finish chunks, or a data chunk and [DONE], joined by a single newline with
+ * no blank line between), and the relay's per-frame checks (hold [DONE], drop a duplicate finish)
+ * only see them when each data line is handled on its own. Non-data lines (comments, `event:`)
+ * attach to the following data line's sub-frame, or form their own when none follows.
+ */
+function splitFrameLines(frame: string): string[] {
+  const subs: string[] = [];
+  let pending: string[] = [];
+  for (const line of frame.split('\n')) {
+    if (line.trim().startsWith('data:')) {
+      subs.push([...pending, line].join('\n'));
+      pending = [];
+    } else {
+      pending.push(line);
+    }
+  }
+  if (pending.length > 0) subs.push(pending.join('\n'));
+  return subs;
+}
+
 /** Whether one frame carries a finish chunk or a content delta: both must stop after the
  *  first finish, since the env's stream_order check fails a stream with two finish chunks
  *  or with a content delta after the finish chunk. A usage chunk (empty choices) is neither,
@@ -483,8 +530,11 @@ function frameCarriesFinishOrContent(frame: string): boolean {
  * chunk can be synthesized before it when the provider sent neither (the env's stream_order check
  * requires a finish chunk and the usage check requires an output of at least 1); a second [DONE] is
  * dropped, since the env fails a stream that carries [DONE] twice. A second finish chunk and any
- * content delta after the first finish are dropped too, since the env fails those as well. The
- * synthesized chunks carry the fixed `created` the model listings use, so the relay stays deterministic.
+ * content delta after the first finish are dropped too, since the env fails those as well. Each
+ * frame is handled line by line, so a frame that packs several events (two finish chunks, or a data
+ * chunk and [DONE]) is cleaned up the same way. A usage chunk is synthesized whenever the stream's
+ * LAST usage record fails the env's check (output 0, or no input), not merely when no usage arrived.
+ * The synthesized chunks carry the fixed `created` the model listings use, so the relay stays deterministic.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -499,32 +549,38 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       const { frames, tail } = splitCompleteFrames(buffer);
       buffer = tail;
       for (const frame of frames) {
-        const hadFinish = state.sawFinish;
-        inspectOpenAIFrame(frame, state);
-        if (frame.trim() === 'data: [DONE]') {
-          // Hold [DONE]: the finish and usage chunks, when synthesized, go before it.
-          state.sawDone = true;
-          continue;
+        for (const sub of splitFrameLines(frame)) {
+          const hadFinish = state.sawFinish;
+          inspectOpenAIFrame(sub, state);
+          if (sub.trim() === 'data: [DONE]') {
+            // Hold [DONE]: the finish and usage chunks, when synthesized, go before it.
+            state.sawDone = true;
+            continue;
+          }
+          // A finish or content frame after the first finish is a duplicate: drop it.
+          if (hadFinish && frameCarriesFinishOrContent(sub)) continue;
+          yield rewriteFrameWithModel(sub, model);
         }
-        // A finish or content frame after the first finish is a duplicate: drop it.
-        if (hadFinish && frameCarriesFinishOrContent(frame)) continue;
-        yield rewriteFrameWithModel(frame, model);
       }
     }
     buffer += decoder.decode();
     const tail = buffer.trim();
-    if (tail !== '' && tail !== 'data: [DONE]') {
-      const hadFinish = state.sawFinish;
-      inspectOpenAIFrame(buffer, state);
-      if (!(hadFinish && frameCarriesFinishOrContent(buffer))) yield rewriteFrameWithModel(buffer, model);
-    } else if (tail === 'data: [DONE]') {
-      state.sawDone = true;
+    if (tail !== '') {
+      for (const sub of splitFrameLines(buffer)) {
+        if (sub.trim() === 'data: [DONE]') {
+          state.sawDone = true;
+          continue;
+        }
+        const hadFinish = state.sawFinish;
+        inspectOpenAIFrame(sub, state);
+        if (!(hadFinish && frameCarriesFinishOrContent(sub))) yield rewriteFrameWithModel(sub, model);
+      }
     }
   } finally {
     reader.releaseLock();
   }
   if (!state.sawFinish) yield buildSyntheticFinishChunk(model);
-  if (!state.sawUsage) yield buildSyntheticUsageChunk(model, state.textChars);
+  if (!lastUsageOk(state)) yield buildSyntheticUsageChunk(model, state.textChars);
   yield 'data: [DONE]\n\n';
 }
 
@@ -656,6 +712,9 @@ function toolCallDeltaEvents(state: AnthropicStreamState, call: Json): string[] 
 function eventsForFrame(frame: string, state: AnthropicStreamState, model: string): string[] {
   const events: string[] = [];
   for (const line of frame.split('\n')) {
+    // Once message_stop has been emitted, nothing more may follow: a provider that sends
+    // a content delta after [DONE] must not reopen a block after the stream closed.
+    if (state.finished) return events;
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) continue;
     const payload = trimmed.slice(5).trim();
