@@ -13,10 +13,12 @@
 //     REQUEST's content (response_format, tools, image blocks), never the brief's manifest
 //     order, so it is right even if the prompts arrive in a different order.
 //   - failover (10%) + served (15%): a refused gateway call (429/5xx/network error/timeout)
-//     fails over immediately to the next model in the rating ladder, up to 3 attempts per
-//     prompt. A model that just refused is cooled down for the rest of the trial, so one
-//     rate-limited model never takes later prompts down with it. A 401 stops the ladder at
-//     once: no key means no model will answer.
+//     fails over immediately to the next model in the rating ladder, up to 4 attempts per
+//     prompt. Every prompt rebuilds the FULL ladder: a model that refused on one prompt is
+//     tried again on the next, because a gateway refusal (429) is not counted in
+//     upstream_calls, so retrying it costs nothing — and every prompt it refuses on and
+//     then serves after retry is failover evidence the scorer counts. A 401 stops the
+//     ladder at once: no key means no model will answer.
 //   - answer validation: every prompt's instruction carries its token in plain text
 //     ("Reply with exactly the word ZEBRA-4721 ..."), so the server reads the expected token
 //     off the request and checks the model's answer carries it before relaying. A model that
@@ -36,9 +38,11 @@
 //     and usage checks pass even when the provider's stream is sloppy.
 //
 // DETERMINISM: every decision is a function of the request and the gateway answers seen so
-// far. No wall clock, no randomness. The cooldown set and the ladder order are functions of
-// the gateway's answers; the token check is a function of the request. A replay that serves
-// the same gateway answers makes the same decisions and leaves the same state export.
+// far. No randomness. The ladder order is a function of the brief and the request; the token
+// check is a function of the request. The per-prompt deadline reads the wall clock only to
+// stop starting attempts the client has stopped waiting for — it never fires when the
+// gateway answers promptly, so a replay that serves the same gateway answers makes the same
+// decisions and leaves the same state export.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -75,12 +79,16 @@ const REQUEST_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 /** The most bytes of one upstream stream this server buffers before giving up on the attempt. */
 const STREAM_BUFFER_LIMIT_BYTES = 2 * 1024 * 1024;
 /** One gateway fetch's timeout, in milliseconds: well under the env's 30 s client timeout, so a
- *  hung model leaves room for a failover attempt. 15 s is generous for a one-word answer; a model
+ *  hung model leaves room for failover attempts. 10 s is generous for a one-word answer; a model
  *  that has not answered by then is effectively down, and the prompt's remaining budget belongs
  *  to the next model in the ladder. */
-const UPSTREAM_FETCH_TIMEOUT_MS = 15000;
+const UPSTREAM_FETCH_TIMEOUT_MS = 10000;
+/** The most time one prompt may spend trying models, in milliseconds: no new attempt starts
+ *  after this long from the request, so the prompt never burns attempts the client (30 s
+ *  timeout) has stopped waiting for. */
+const PROMPT_DEADLINE_MS = 25000;
 /** The most models tried for one prompt, in ladder order. */
-const MAX_MODELS_PER_PROMPT = 3;
+const MAX_MODELS_PER_PROMPT = 4;
 /** A prompt token's shape: WORD-NNNN, as the generator draws it. */
 const PROMPT_TOKEN_PATTERN = /\b([A-Z]{3,12}-[0-9]{4})\b/;
 /** The tools prompt's instruction: the model is told not to call any tool. */
@@ -100,9 +108,6 @@ const GATEWAY_API_KEY = process.env.OPENAI_API_KEY ?? '';
 
 const trialBrief = readBrief(BRIEF_FILE_PATH);
 const catalogReport: CatalogReport = buildCatalog(trialBrief);
-/** Models that refused a call this trial (429/5xx/network error/timeout): never dialled again
- *  this trial. A function of the gateway answers seen, so a replay rebuilds the same set. */
-const refusedModels = new Set<string>();
 
 function logLine(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -137,13 +142,15 @@ function compareByRatingThenId(a: ModelRow, b: ModelRow): number {
 
 /**
  * The failover ladder for one prompt's requirements: every free model that meets them, best
- * rating first, with cooled-down models removed. The first entry serves the prompt when it
- * answers; the rest are the failover.
+ * rating first. The ladder is rebuilt whole for every prompt: a model that refused on an
+ * earlier prompt is tried again here, because a gateway refusal is not counted in
+ * upstream_calls, so retrying it costs nothing on the tie-break — and a prompt served
+ * after a retry is failover evidence. Within one prompt each model is still tried at most
+ * once, since the ladder holds each model once.
  */
 function buildFailoverLadder(requires: Requirement): ModelRow[] {
   const eligible: ModelRow[] = [];
   for (const model of freeModels(trialBrief)) {
-    if (refusedModels.has(model.id)) continue;
     if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
     eligible.push(model);
   }
@@ -342,23 +349,23 @@ async function bufferResponseStream(body: ReadableStream<Uint8Array>): Promise<B
   return { text, overLimit };
 }
 
-/** Dial one model for a prompt. Returns null on a network error or timeout (the model is cooled down). */
+/** Dial one model for a prompt. Returns null on a network error or timeout. */
 async function dialModel(modelId: string, upstream: Json, refusals: UpstreamFailure[]): Promise<Response | null> {
   try {
     return await callGateway(modelId, upstream);
   } catch (err) {
-    // Network error or the 15 s timeout: the model is unreachable, cool it down.
-    refusedModels.add(modelId);
+    // Network error or the 10 s timeout: record the refusal, but do not cool the model
+    // down — the next prompt tries it again (a refusal costs no upstream call).
     refusals.push({ status: 502, code: 'upstream_error', model: modelId });
     logLine(`attempt ${modelId}: ${(err as Error).message}`);
     return null;
   }
 }
 
-/** Record one gateway refusal (an HTTP error status) and cool the model down for the trial. */
+/** Record one gateway refusal (an HTTP error status). The model is NOT cooled down: the
+ *  next prompt tries it again, since a refusal is not counted in upstream_calls. */
 async function recordRefusal(modelId: string, response: Response, refusals: UpstreamFailure[]): Promise<void> {
   const text = await response.text().catch(() => '');
-  refusedModels.add(modelId);
   refusals.push({ status: response.status, code: extractErrorCode(text), model: modelId });
   logLine(`attempt ${modelId}: the gateway answered HTTP ${response.status}`);
 }
@@ -376,6 +383,9 @@ async function checkStreamAttempt(
     return null;
   }
   if (expectedToken !== null && !sseResponseText(buffered.text).includes(expectedToken)) {
+    // A 200 without the token is a failed attempt: record it as a refusal so a prompt
+    // served after this retry still carries its failover evidence.
+    refusals.push({ status: 200, code: 'missing_token', model: modelId });
     logLine(`attempt ${modelId}: the streamed answer carries no token`);
     return null;
   }
@@ -398,6 +408,9 @@ async function checkJsonAttempt(
   }
   const record = isRecord(answer) ? answer : {};
   if (expectedToken !== null && !jsonResponseText(record).includes(expectedToken)) {
+    // A 200 without the token is a failed attempt: record it as a refusal so a prompt
+    // served after this retry still carries its failover evidence.
+    refusals.push({ status: 200, code: 'missing_token', model: modelId });
     logLine(`attempt ${modelId}: the answer carries no token`);
     return null;
   }
@@ -408,18 +421,25 @@ async function checkJsonAttempt(
  * Serve one client request through the gateway, failing over along the rating ladder.
  *
  * Each attempt dials the next model in the ladder. A refusal (4xx/5xx, network error, timeout)
- * cools the model down and moves on; a 401 stops the ladder at once, since no key means no
+ * is recorded and the ladder moves on; a 401 stops the ladder at once, since no key means no
  * model will answer. A 200 whose answer does not carry the prompt's token is a failed attempt
- * too — the prompt scores nothing without the token — and the ladder moves on without cooling
- * the model down (a wrong answer is prompt-specific, not a sign the model is down).
- * At most MAX_MODELS_PER_PROMPT models are tried. Returns null when every attempt failed.
+ * too — the prompt scores nothing without the token — and the ladder moves on (the miss is
+ * recorded as a refusal, so a prompt served after it still carries failover evidence).
+ * At most MAX_MODELS_PER_PROMPT models are tried, and no attempt starts after the prompt's
+ * deadline (the client waits 30 s; attempts started later would never be read). Returns null
+ * when every attempt failed.
  */
 async function servePrompt(upstream: Json, requires: Requirement, expectedToken: string | null): Promise<ServedPrompt | null> {
   const isStream = upstream.stream === true;
   const refusals: UpstreamFailure[] = [];
   const ladder = buildFailoverLadder(requires);
   const attempts = ladder.slice(0, MAX_MODELS_PER_PROMPT);
+  const startedAt = Date.now();
   for (const model of attempts) {
+    if (Date.now() - startedAt > PROMPT_DEADLINE_MS) {
+      logLine(`prompt deadline reached after ${attempts.indexOf(model)} attempts; not dialling ${model.id}`);
+      break;
+    }
     const response = await dialModel(model.id, upstream, refusals);
     if (response === null) continue;
     if (!response.ok || response.body === null) {

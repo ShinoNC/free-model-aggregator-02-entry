@@ -401,7 +401,13 @@ function inspectOpenAIFrame(frame: string, state: OpenAIStreamState): void {
     if (payload === null) continue;
     const chunk = parseDataChunk(payload);
     if (chunk === null) continue;
-    if (isRecord(chunk.usage)) state.sawUsage = true;
+    // A usage record only counts when its output is at least 1: the env's usage check
+    // requires an output of at least 1, and a provider that reports completion_tokens 0
+    // (or omits it) must not stop the relay from synthesizing a usage chunk. This mirrors
+    // the JSON path (openAIJsonWithModel) and the Anthropic path (streamFinishEvents).
+    if (isRecord(chunk.usage) && typeof chunk.usage.completion_tokens === 'number' && chunk.usage.completion_tokens >= 1) {
+      state.sawUsage = true;
+    }
     if (!Array.isArray(chunk.choices) || chunk.choices.length === 0) continue;
     const choice = isRecord(chunk.choices[0]) ? chunk.choices[0] : null;
     if (choice === null) continue;
@@ -449,6 +455,25 @@ function splitCompleteFrames(buffer: string): { frames: string[]; tail: string }
   return { frames, tail: rest };
 }
 
+/** Whether one frame carries a finish chunk or a content delta: both must stop after the
+ *  first finish, since the env's stream_order check fails a stream with two finish chunks
+ *  or with a content delta after the finish chunk. A usage chunk (empty choices) is neither,
+ *  so it passes through even after the finish — OpenAI sends usage after finish_reason. */
+function frameCarriesFinishOrContent(frame: string): boolean {
+  for (const line of frame.split('\n')) {
+    const payload = dataPayloadOf(line);
+    if (payload === null) continue;
+    const chunk = parseDataChunk(payload);
+    if (chunk === null || !Array.isArray(chunk.choices) || chunk.choices.length === 0) continue;
+    const choice = isRecord(chunk.choices[0]) ? chunk.choices[0] : null;
+    if (choice === null) continue;
+    if (typeof choice.finish_reason === 'string') return true;
+    const delta = isRecord(choice.delta) ? choice.delta : null;
+    if (delta !== null && typeof delta.content === 'string') return true;
+  }
+  return false;
+}
+
 /**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
  * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
@@ -457,8 +482,9 @@ function splitCompleteFrames(buffer: string): { frames: string[]; tail: string }
  * Hardened for sloppy providers: [DONE] is held until the stream ends, so a finish chunk and a usage
  * chunk can be synthesized before it when the provider sent neither (the env's stream_order check
  * requires a finish chunk and the usage check requires an output of at least 1); a second [DONE] is
- * dropped, since the env fails a stream that carries [DONE] twice. The synthesized chunks carry the
- * fixed `created` the model listings use, so the relay stays deterministic.
+ * dropped, since the env fails a stream that carries [DONE] twice. A second finish chunk and any
+ * content delta after the first finish are dropped too, since the env fails those as well. The
+ * synthesized chunks carry the fixed `created` the model listings use, so the relay stays deterministic.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -473,20 +499,24 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       const { frames, tail } = splitCompleteFrames(buffer);
       buffer = tail;
       for (const frame of frames) {
+        const hadFinish = state.sawFinish;
         inspectOpenAIFrame(frame, state);
         if (frame.trim() === 'data: [DONE]') {
           // Hold [DONE]: the finish and usage chunks, when synthesized, go before it.
           state.sawDone = true;
           continue;
         }
+        // A finish or content frame after the first finish is a duplicate: drop it.
+        if (hadFinish && frameCarriesFinishOrContent(frame)) continue;
         yield rewriteFrameWithModel(frame, model);
       }
     }
     buffer += decoder.decode();
     const tail = buffer.trim();
     if (tail !== '' && tail !== 'data: [DONE]') {
+      const hadFinish = state.sawFinish;
       inspectOpenAIFrame(buffer, state);
-      yield rewriteFrameWithModel(buffer, model);
+      if (!(hadFinish && frameCarriesFinishOrContent(buffer))) yield rewriteFrameWithModel(buffer, model);
     } else if (tail === 'data: [DONE]') {
       state.sawDone = true;
     }
